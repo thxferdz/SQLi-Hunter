@@ -34,12 +34,13 @@ time_based_payloads_templates = [
     "' OR IF(1=1,SLEEP({delay}),0) --"
 ]
 
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 SQLiHunter/1.2"
-DEFAULT_TIMEOUT = 15
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 SQLiHunter/1.1" # User agent disesuaikan dengan versi banner
+DEFAULT_TIMEOUT = 15 # Ini adalah variabel global yang akan diubah oleh argumen --timeout
 BASELINE_SAMPLES = 3
 NETWORK_TOLERANCE = 1.0
 
 def make_request_session(session, url, timeout=DEFAULT_TIMEOUT):
+    # Fungsi ini akan menggunakan nilai DEFAULT_TIMEOUT saat ini
     try:
         response = session.get(url, timeout=timeout, verify=False, allow_redirects=True)
         return response
@@ -59,7 +60,8 @@ def check_error_based_sqli(session, base_url_parts, original_params_dict, param_
         test_params[param_to_test] = current_param_values
         query_string = urlencode(test_params, doseq=True)
         test_url = urlunparse(base_url_parts._replace(query=query_string))
-        response = make_request_session(session, test_url)
+        # Gunakan DEFAULT_TIMEOUT yang mungkin sudah diupdate oleh args
+        response = make_request_session(session, test_url, timeout=DEFAULT_TIMEOUT)
         if response:
             for error_msg in sql_error_messages:
                 if error_msg.lower() in response.text.lower():
@@ -80,7 +82,8 @@ def check_time_based_sqli(session, base_url_parts, original_params_dict, param_t
     print(f"    Mengambil {BASELINE_SAMPLES} sampel baseline...")
     for i in range(BASELINE_SAMPLES):
         start = time.time()
-        response = make_request_session(session, baseline_url)
+        # Gunakan DEFAULT_TIMEOUT yang mungkin sudah diupdate oleh args
+        response = make_request_session(session, baseline_url, timeout=DEFAULT_TIMEOUT)
         end = time.time()
         if response:
             baseline_durations.append(end - start)
@@ -102,6 +105,7 @@ def check_time_based_sqli(session, base_url_parts, original_params_dict, param_t
         test_params[param_to_test] = current_param_values
         query_string = urlencode(test_params, doseq=True)
         test_url = urlunparse(base_url_parts._replace(query=query_string))
+        # Timeout untuk request ini juga harus mempertimbangkan DEFAULT_TIMEOUT yang mungkin sudah diupdate
         request_timeout = delay_seconds + DEFAULT_TIMEOUT + NETWORK_TOLERANCE
         start = time.time()
         response = make_request_session(session, test_url, timeout=request_timeout)
@@ -131,18 +135,23 @@ PERINGATAN KERAS:
   4. WAJIB lakukan verifikasi manual dan gunakan SQLMap untuk konfirmasi.
 """
     )
+    # Argumen --timeout akan menggunakan nilai DEFAULT_TIMEOUT global sebagai nilai defaultnya
+    # dan juga untuk string help-nya.
     parser.add_argument("url", help="URL target untuk diuji")
     parser.add_argument("--delay", type=int, default=5, help="Delay (detik) untuk time-based (default: 5)")
     parser.add_argument("--user-agent", type=str, default=DEFAULT_USER_AGENT, help=f"User-Agent HTTP")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout HTTP (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, 
+                        help=f"Timeout HTTP (detik) (default: {DEFAULT_TIMEOUT})")
     args = parser.parse_args()
 
-    global DEFAULT_TIMEOUT
+    # Mengubah nilai variabel global DEFAULT_TIMEOUT berdasarkan argumen pengguna.
+    global DEFAULT_TIMEOUT 
     DEFAULT_TIMEOUT = args.timeout
+
 
     print("""
 ********************************************************************
-* SQLiHunter v1.2 (Executable)                     *
+* SQLiHunter v1.1                              *
 * Basic SQL Injection Vulnerability Probe (GET Params)      *
 * *
 * !! PERINGATAN: HANYA UNTUK TUJUAN EDUKASI & SAH !!        *
@@ -168,7 +177,8 @@ PERINGATAN KERAS:
     session = requests.Session()
     session.headers.update({"User-Agent": args.user_agent})
 
-    initial_response = make_request_session(session, target_url)
+    # Menggunakan DEFAULT_TIMEOUT yang sudah diupdate untuk request awal
+    initial_response = make_request_session(session, target_url, timeout=DEFAULT_TIMEOUT)
     if not initial_response:
         print("[-] Gagal mendapatkan respons awal. Keluar.")
         return
@@ -177,8 +187,11 @@ PERINGATAN KERAS:
     vulnerabilities_found = []
     for param_name in list(original_params_dict.keys()):
         print(f"\n--- Menguji Parameter: {param_name} ---")
+        # Fungsi check_error_based_sqli dan check_time_based_sqli akan menggunakan
+        # nilai DEFAULT_TIMEOUT yang sudah diupdate melalui make_request_session.
         is_error, error_url = check_error_based_sqli(session, parsed_url, original_params_dict.copy(), param_name, original_status_code)
         if is_error: vulnerabilities_found.append({"type": "Error-Based", "url_test": error_url, "parameter": param_name, "original_url": target_url})
+        
         is_time, time_url = check_time_based_sqli(session, parsed_url, original_params_dict.copy(), param_name, args.delay)
         if is_time: vulnerabilities_found.append({"type": "Time-Based", "url_test": time_url, "parameter": param_name, "original_url": target_url})
 
@@ -190,7 +203,7 @@ PERINGATAN KERAS:
             print(f"\n--- Potensi #{idx+1} ---")
             print(f"  [-] Tipe        : {vuln['type']}")
             print(f"  [-] Parameter   : {vuln['parameter']}")
-            print(f"  [*] Saran SQLMap  : sqlmap -u \"{vuln['original_url']}\" -p {vuln['parameter']} --batch --dbs --level=3 --risk=3")
+            print(f"  [*] Saran SQLMap  : sqlmap -u \"{vuln['original_url']}\" -p \"{vuln['parameter']}\" --batch --dbs --level=3 --risk=3")
             print(f"  [*] INGAT: WAJIB verifikasi!")
     else:
         print("[-] Tidak ada indikasi kerentanan SQL Injection yang terdeteksi.")
